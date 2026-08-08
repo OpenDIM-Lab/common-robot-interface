@@ -209,8 +209,6 @@ def get_controller(controller_type: str):
         from cri.dobot.mg400_controller import MG400Controller
         return MG400Controller
     elif controller_type in ('cr', 'nova2'):
-        # The Dobot Nova2 speaks the same TCP-IP protocol as the CR series, so it is driven by
-        # CRController. 'nova2' is accepted as a readable alias for 'cr'.
         from cri.dobot.cr_controller import CRController
         return CRController
     elif controller_type == 'ur':
