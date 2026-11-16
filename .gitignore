@@ -107,3 +107,5 @@ venv.bak/
 uv.lock
 !pyproject.toml
 .venv/
+
+.vscode/
