@@ -220,13 +220,16 @@ def get_controller(controller_type: str):
     elif controller_type == 'franka':
         from cri.franka.pyfranka_controller import PyfrankaController
         return PyfrankaController
+    elif controller_type == 'topstar':
+        from cri.topstar.topstar_controller import TopstarController
+        return TopstarController
     else:
         raise ValueError(f"Unknown controller type: {controller_type}")
 
 
 class _ControllerDict(dict):
     """Dictionary-like controller registry that imports implementations on demand."""
-    _controller_types = {'abb', 'dummy', 'magician', 'mg400', 'cr', 'nova2', 'ur', 'sim', 'franka'}
+    _controller_types = {'abb', 'dummy', 'magician', 'mg400', 'cr', 'nova2', 'ur', 'sim', 'franka', 'topstar'}
 
     def __getitem__(self, key):
         return get_controller(key)
@@ -242,3 +245,17 @@ class _ControllerDict(dict):
 
 
 Controller = _ControllerDict()
+
+
+def __getattr__(name):
+    """Keep legacy class imports working without eagerly importing vendors."""
+    legacy = {
+        "ABBController": "abb", "DummyController": "dummy",
+        "MagicianController": "magician", "MG400Controller": "mg400",
+        "CRController": "cr", "RTDEController": "ur",
+        "SimController": "sim", "PyfrankaController": "franka",
+        "TopstarController": "topstar",
+    }
+    if name in legacy:
+        return get_controller(legacy[name])
+    raise AttributeError("module {!r} has no attribute {!r}".format(__name__, name))

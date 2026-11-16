@@ -14,11 +14,32 @@ This fork extends the support to these robot arms:
 - Dobot CR - using the [TCP-IP-4Axis-Python library](https://github.com/Dobot-Arm/TCP-IP-CR-Python-CMD) 
 - Dobot MG400 - using the [TCP-IP-4Axis-Python library](https://github.com/Dobot-Arm/TCP-IP-4Axis-Python-CMD) 
 - Dobot Magician
+- Topstar TRV007-710-S / TRI100 - using the vendor X5 Python SDK
 - Simulated robot arm - using the [Tactile Sim library](https://github.com/dexterousrobot/tactile_sim)
 
 A GUI-based robot jogger tool is also included with the library.  This tool can be used to move the robot into different configurations.
 
 ## Installation
+
+### Topstar X5 backend
+
+Select `get_controller("topstar")` from `cri.controller`. Install the vendor
+`xapi` wheel for CPython 3.10 and your platform in the runtime environment.
+The backend connects and reads on construction. Call `prepare_motion()` to
+enable motion. `command_speed`, `command_acceleration`, and
+`command_deceleration` set `MovPointAdd.vel`, `.acc`, and `.dec` independently.
+Each accepts an integer percentage from 1 to 100. The cabinet manages its
+global override and the teach pendant's jog settings.
+
+For a software TCP, use TF0. For a calibrated cabinet tool, use an identity
+software TCP. After executing motion, call `disable_servo()` before disconnecting.
+The collection workflow and local configuration are in the sim2real repository.
+
+Run the offline backend checks with:
+
+```sh
+python -m pytest -q tests/test_topstar_controller.py tests/test_topstar_servo.py tests/test_topstar_sdk_contract.py tests/test_robot_contract.py tests/test_controller_compat.py
+```
 
 To install the package on Windows or Linux, clone the repository and run the setup script from the repository root directory:
 

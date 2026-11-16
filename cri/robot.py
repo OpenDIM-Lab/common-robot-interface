@@ -1,9 +1,10 @@
 """Robot class provide a common, higher-level interface to various robot arms.
 """
 
-import queue
 from abc import ABC, abstractmethod
-from threading import Thread
+from concurrent.futures import Future
+from contextlib import contextmanager
+from threading import Lock, Thread
 
 import numpy as np
 
@@ -342,11 +343,21 @@ class SyncRobot(Robot):
 
     @tcp.setter
     def tcp(self, tcp):
-        """Sets the tool center point (TCP) of the robot. 
+        """Set the software tool offset, without writing controller parameters.
+
+        With Topstar TF0 this is the tool pose relative to the flange. A
+        controller-managed Topstar tool must use an identity software offset.
         """
         check_pose(tcp)
-        self.controller_tcp = (0, 0, 0, 0, 0, 0) # zero as can persist on robot
-        self._tcp_q = np.array(euler2quat(tcp, self._axes)) 
+        tcp_q = np.array(euler2quat(tcp, self._axes))
+        if not np.all(np.isfinite(tcp_q)):
+            raise InvalidEulerPose("TCP must contain finite numbers")
+        identity = np.allclose(tcp_q[:3], 0, atol=1e-12, rtol=0) and np.allclose(
+            np.abs(tcp_q[3:]), (1, 0, 0, 0), atol=1e-12, rtol=0)
+        if not getattr(self.controller, "supports_software_tcp", True) and not identity:
+            raise ValueError("Use identity robot.tcp with a controller-managed tool; "
+                             "use Topstar tool_index=0 for a software TCP")
+        self._tcp_q = tcp_q
         
     @property
     def tcp_controller(self):
@@ -425,6 +436,17 @@ class SyncRobot(Robot):
         self.controller.blend_radius = blend_radius
 
     @property
+    def command_speed(self):
+        """Backend per-command speed percentage."""
+        return self.controller.command_speed
+
+    @command_speed.setter
+    def command_speed(self, speed):
+        if not hasattr(self.controller, "command_speed"):
+            raise NotImplementedError("Controller has no command_speed percentage interface")
+        self.controller.command_speed = speed
+
+    @property
     def joint_angles(self):
         """ Returns the current joint angles.
         """
@@ -442,8 +464,8 @@ class SyncRobot(Robot):
         """
         base_pose_q = self.controller.pose
         pose_q = transform(base_pose_q, self._coord_frame_q)
-        frame_q = frame(pose_q, self._tcp_q)
-        return quat2euler(frame_q, self._axes)
+        tcp_pose_q = inv_transform(self._tcp_q, pose_q)
+        return quat2euler(tcp_pose_q, self._axes)
     
     @property
     def target_pose(self):
@@ -451,8 +473,8 @@ class SyncRobot(Robot):
         """
         base_pose_q = self.controller.commanded_pose
         pose_q = transform(base_pose_q, self._coord_frame_q)
-        frame_q = frame(pose_q, self._tcp_q)
-        return quat2euler(frame_q, self._axes)
+        tcp_pose_q = inv_transform(self._tcp_q, pose_q)
+        return quat2euler(tcp_pose_q, self._axes)
 
     @property
     def elbow(self):
@@ -473,29 +495,73 @@ class SyncRobot(Robot):
         joint_angles = np.array(joint_angles)
         self.controller.move_joints(joint_angles)
     
-    def move_linear(self, pose, elbow=None):
+    def move_linear(self, pose, elbow=None, *, wrist=0):
         """Executes a linear/cartesian move from the current TCP pose to the
         specified pose in the reference coordinate frame.
         """
+        target = self._to_controller_pose(pose)
+        if wrist == 0:
+            self.controller.move_linear(target, elbow)
+        elif wrist == 1:
+            self.controller.move_linear(target, elbow, wrist=wrist)
+        else:
+            raise ValueError("wrist must be 0 or 1")
+
+    def check_linear_targets(self, poses):
+        """Check consecutive TCP targets using the controller's read-only IK."""
+        self._controller_call("check_linear_targets", [self._to_controller_pose(pose) for pose in poses])
+
+    @contextmanager
+    def linear_path_checker(self):
+        """Check successive TCP target groups without moving the robot."""
+        with self._controller_call("linear_path_checker") as check:
+            def check_tcp(poses):
+                check([self._to_controller_pose(pose) for pose in poses])
+            yield check_tcp
+
+    def _to_controller_pose(self, pose):
         check_pose(pose)
         pose_q = euler2quat(pose, self._axes)
-        tcp_pose_q = inv_transform(self._tcp_q, pose_q)
-        base_tcp_pose_q = inv_transform(tcp_pose_q, self._coord_frame_q) 
-        self.controller.move_linear(base_tcp_pose_q, elbow)
+        endpoint_pose_q = frame(pose_q, self._tcp_q)
+        return inv_transform(endpoint_pose_q, self._coord_frame_q)
 
     def move_circular(self, via_pose, end_pose, elbow=None):
         """Executes a movement in a circular path from the current TCP pose,
         through via_pose, to end_pose in the reference coordinate frame.
         """
-        check_pose(via_pose)
-        via_pose_q = euler2quat(via_pose, self._axes)
-        tcp_via_pose_q = inv_transform(self._tcp_q, via_pose_q)
-        base_tcp_via_pose_q = inv_transform(tcp_via_pose_q, self._coord_frame_q)
-        check_pose(end_pose)
-        end_pose_q = euler2quat(end_pose, self._axes)
-        tcp_end_pose_q = inv_transform(self._tcp_q, end_pose_q)
-        base_tcp_end_pose_q = inv_transform(tcp_end_pose_q, self._coord_frame_q)
-        self.controller.move_circular(base_tcp_via_pose_q, base_tcp_end_pose_q, elbow)
+        self.controller.move_circular(self._to_controller_pose(via_pose),
+                                      self._to_controller_pose(end_pose), elbow)
+
+    def _controller_call(self, name, *args, **kwargs):
+        method = getattr(self.controller, name, None)
+        if method is None:
+            raise NotImplementedError("{} does not support {}".format(
+                type(self.controller).__name__, name))
+        return method(*args, **kwargs)
+
+    def prepare_motion(self):
+        return self._controller_call("prepare_motion")
+
+    def prepare_servo(self, **options):
+        """Explicitly begin native servo submission; see the backend contract."""
+        return self._controller_call("prepare_servo", **options)
+
+    def servo_move_linear(self, pose, elbow=None):
+        """Submit a servo target; return does not mean the target was reached."""
+        return self._controller_call("servo_move_linear", self._to_controller_pose(pose), elbow)
+
+    def servo_move_joints(self, joint_angles):
+        check_joint_angles(joint_angles)
+        return self._controller_call("servo_move_joints", np.array(joint_angles))
+
+    def stop(self):
+        return self._controller_call("stop")
+
+    def abort(self):
+        return self._controller_call("abort")
+
+    def disable_servo(self):
+        return self._controller_call("disable_servo")
 
     def close(self):
         """Releases any resources held by the robot (e.g., sockets).
@@ -508,12 +574,17 @@ class AsyncRobot(Robot):
     asynchronous (non-blocking) movement primitives.
     """
     
-    def __init__(self, sync_robot):
+    def __init__(self, sync_robot, *, close_timeout=5):
         self.sync_robot = sync_robot
         try:
+            if not np.isfinite(close_timeout) or close_timeout <= 0:
+                raise ValueError("close_timeout must be positive and finite")
+            self._close_timeout = float(close_timeout)
+            self._async_lock = Lock()
             self._worker = None
-            self._results = queue.Queue()
+            self._future = None
             self._busy = False
+            self._closed = False
         except:
             self.sync_robot.close()
             raise
@@ -587,6 +658,14 @@ class AsyncRobot(Robot):
         self.sync_robot.blend_radius = blend_radius
 
     @property
+    def command_speed(self):
+        return self.sync_robot.command_speed
+
+    @command_speed.setter
+    def command_speed(self, speed):
+        self.sync_robot.command_speed = speed
+
+    @property
     def joint_angles(self):
         return self.sync_robot.joint_angles
 
@@ -619,6 +698,49 @@ class AsyncRobot(Robot):
     def move_circular(self, via_pose, end_pose, elbow=None):
         self.sync_robot.move_circular(via_pose, end_pose, elbow)
 
+    def prepare_motion(self):
+        return self.sync_robot.prepare_motion()
+
+    def prepare_servo(self, **options):
+        return self.sync_robot.prepare_servo(**options)
+
+    def servo_move_linear(self, pose, elbow=None):
+        return self.sync_robot.servo_move_linear(pose, elbow)
+
+    def servo_move_joints(self, joint_angles):
+        return self.sync_robot.servo_move_joints(joint_angles)
+
+    def stop(self):
+        return self.sync_robot.stop()
+
+    def abort(self):
+        return self.sync_robot.abort()
+
+    def disable_servo(self):
+        return self.sync_robot.disable_servo()
+
+    def _start_async(self, method, *args):
+        with self._async_lock:
+            if self._closed:
+                raise RuntimeError("Robot is closed")
+            if self._busy:
+                raise AsyncBusy
+            future = Future()
+
+            def run():
+                try:
+                    future.set_result(method(*args))
+                except BaseException as error:
+                    future.set_exception(error)
+
+            worker = Thread(target=run, daemon=True)
+            self._future, self._worker, self._busy = future, worker, True
+            try:
+                worker.start()
+            except BaseException:
+                self._future, self._worker, self._busy = None, None, False
+                raise
+
     def async_move_joints(self, joint_angles):
         """Executes an immediate move to the specified joint angles.
         
@@ -626,13 +748,7 @@ class AsyncRobot(Robot):
         j0, j1, j2, j3, j4, j5 specify the joint angles (degrees), numbered
         from base to end effector
         """
-        if self._busy:
-            raise AsyncBusy  
-        self._busy = True
-        self._worker = Thread(target=lambda joint_angles, results: \
-                              results.put(self.sync_robot.move_joints(joint_angles)), \
-                              args=(joint_angles, self._results))
-        self._worker.start()
+        self._start_async(self.sync_robot.move_joints, np.array(joint_angles, copy=True))
     
     def async_move_linear(self, pose, elbow=None):
         """Executes a linear/cartesian move from the current TCP pose to the
@@ -643,13 +759,7 @@ class AsyncRobot(Robot):
         alpha, beta, gamma specify an euler rotation (degrees)
         elbow = target elbow angle for 7-DOF robot arms (optional; degrees)
         """
-        if self._busy:
-            raise AsyncBusy   
-        self._busy = True
-        self._worker = Thread(target=lambda pose, elbow, results: \
-                              results.put(self.sync_robot.move_linear(pose, elbow)), \
-                              args=(pose, elbow, self._results))
-        self._worker.start()
+        self._start_async(self.sync_robot.move_linear, np.array(pose, copy=True), elbow)
 
     def async_move_circular(self, via_pose, end_pose, elbow=None):
         """Executes a movement in a circular path from the current TCP pose,
@@ -660,32 +770,56 @@ class AsyncRobot(Robot):
         alpha, beta, gamma specify an euler rotation (degrees)
         elbow = target elbow angle for 7-DOF robot arms (optional; degrees)
         """
-        if self._busy:
-            raise AsyncBusy
-        self._busy = True
-        self._worker = Thread(target=lambda via_pose, end_pose, elbow, results: \
-                              results.put(self.sync_robot.move_circular(via_pose, end_pose, elbow)),\
-                              args=(via_pose, end_pose, elbow, self._results))
-        self._worker.start()
+        self._start_async(self.sync_robot.move_circular,
+                          np.array(via_pose, copy=True), np.array(end_pose, copy=True), elbow)
+
+    def async_servo_move_linear(self, pose, elbow=None):
+        """Run one native servo submission in a worker; consume async_result()."""
+        self._start_async(self.sync_robot.servo_move_linear, np.array(pose, copy=True), elbow)
+
+    def async_servo_move_joints(self, joint_angles):
+        self._start_async(self.sync_robot.servo_move_joints, np.array(joint_angles, copy=True))
     
-    def async_result(self):
-        """Blocks for result of asynchronous operation.
+    def async_result(self, timeout=None):
+        """Wait for a submission/move and re-raise its original exception.
+
+        A timeout leaves the result pending so it can be collected later.
         """
-        if not self._busy:
-            raise AsyncNotBusy            
-        self._worker.join()
-        result = self._results.get()
-        self._busy = False
-        return result
+        with self._async_lock:
+            if not self._busy:
+                raise AsyncNotBusy
+            worker, future = self._worker, self._future
+        worker.join(timeout)
+        if worker.is_alive():
+            raise TimeoutError("Asynchronous operation is still running")
+        try:
+            return future.result()
+        finally:
+            with self._async_lock:
+                if self._future is future:
+                    self._busy = False
+                    self._worker = self._future = None
     
     def async_done(self):
         """Checks to see whether asynchronous operation has finished.
         """
-        if not self._busy:
-            raise AsyncNotBusy  
-        return not self._worker.is_alive()
+        with self._async_lock:
+            if not self._busy:
+                raise AsyncNotBusy
+            return not self._worker.is_alive()
         
     def close(self):
         """Releases any resources held by the robot (e.g., sockets).
         """
-        self.sync_robot.close()
+        with self._async_lock:
+            if self._closed:
+                return
+            self._closed = True
+            worker = self._worker
+        try:
+            self.sync_robot.close()
+        finally:
+            if worker is not None:
+                worker.join(self._close_timeout)
+                if worker.is_alive():
+                    raise TimeoutError("Robot closed but the SDK worker has not returned")

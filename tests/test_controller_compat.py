@@ -1,10 +1,21 @@
 import importlib
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
 
 
 class ControllerRegistryTests(unittest.TestCase):
+    def test_legacy_topstar_class_import_is_lazy_and_matches_registry(self):
+        result = subprocess.run([
+            sys.executable, '-c',
+            "import sys; from cri.controller import TopstarController, get_controller; "
+            "assert TopstarController is get_controller('topstar'); "
+            "assert 'xapi.api' not in sys.modules; "
+            "assert 'cri.franka.pyfranka_controller' not in sys.modules",
+        ], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_controller_import_does_not_eagerly_import_backends(self):
         sys.modules.pop("cri.controller", None)
         for module_name in (
@@ -12,14 +23,25 @@ class ControllerRegistryTests(unittest.TestCase):
             "cri.dobot.mg400_controller",
             "cri.franka.pyfranka_controller",
             "cri.sim.sim_controller",
+            "cri.topstar.topstar_controller",
         ):
             sys.modules.pop(module_name, None)
 
         controller_module = importlib.import_module("cri.controller")
 
         self.assertIn("sim", controller_module.Controller)
+        self.assertIn("topstar", controller_module.Controller)
         self.assertNotIn("cri.franka.pyfranka_controller", sys.modules)
+        self.assertNotIn("cri.topstar.topstar_controller", sys.modules)
         self.assertEqual(controller_module.Controller.get("missing", "fallback"), "fallback")
+
+    def test_topstar_lookup_uses_the_lazy_registry(self):
+        from cri.controller import Controller, get_controller
+        from cri.topstar.topstar_controller import TopstarController
+
+        self.assertIs(get_controller("topstar"), TopstarController)
+        self.assertIs(Controller["topstar"], TopstarController)
+        self.assertIs(Controller.get("topstar"), TopstarController)
 
 
 class FakeMG400Client:
