@@ -119,6 +119,8 @@ class TopstarController(RobotController):
 
     ``tool_index=0`` uses the immutable flange frame and fits SyncRobot's
     software TCP. Indices 1..16 opt into a controller-managed TCP.
+    ``wrist`` selects the approach policy only; ordinary ``move_linear`` keeps
+    its independent per-call wrist option and default.
     """
 
     _REQUIRED_API = (
@@ -133,7 +135,8 @@ class TopstarController(RobotController):
                  blend_radius=0, blend_mapping=None, tool_index=0,
                  move_timeout=60, state_timeout=5, poll_interval=0.02,
                  link_timeout=2, retry_num=5, joint_limits=None,
-                 command_speed=1, command_acceleration=1, command_deceleration=1):
+                 command_speed=1, command_acceleration=1, command_deceleration=1,
+                 wrist=1):
         self._ip = str(ip)
         self._sdk = sdk
         self._handle = None
@@ -154,6 +157,7 @@ class TopstarController(RobotController):
         self.command_speed = command_speed
         self._command_acceleration = _integer(command_acceleration, 1, 100, "command_acceleration (%)")
         self._command_deceleration = _integer(command_deceleration, 1, 100, "command_deceleration (%)")
+        self._approach_wrist = _integer(wrist, 0, 1, "wrist")
         self._euler_axes = None if euler_axes is None else _axes(euler_axes)
         self._tool_index = _integer(tool_index, 0, 16, "tool_index")
         self._move_timeout = _positive(move_timeout, "move_timeout")
@@ -636,6 +640,16 @@ class TopstarController(RobotController):
 
         self._motion(build)
 
+    def move_linear_approach(self, pose, previous_pose=None):
+        """Apply wrist mode only between samples with different orientations."""
+        pose = _quaternion_pose(pose)
+        wrist = 0
+        if self._approach_wrist and previous_pose is not None:
+            previous = _quaternion_pose(previous_pose)
+            if abs(np.dot(previous[3:], pose[3:])) < 1 - 1e-12:
+                wrist = self._approach_wrist
+        return self.move_linear(pose, wrist=wrist)
+
     def move_circular(self, via_pose, end_pose, elbow=None):
         if elbow is not None:
             raise ValueError("TRV007-710-S is a six-axis arm; elbow is unsupported")
@@ -885,6 +899,10 @@ class TopstarController(RobotController):
                 self._moving = False
             except Exception as error:
                 raise TopstarSDKError("disable_servo", error) from error
+
+    def finish_motion(self):
+        """Finish an explicit motion session by confirming servo-off."""
+        self.disable_servo()
 
     def close(self):
         """Stop this adapter's active motion and disconnect. Idempotent.

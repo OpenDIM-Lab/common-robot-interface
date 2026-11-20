@@ -317,6 +317,37 @@ class SyncRobot(Robot):
             self.controller.close()
             raise
 
+    @classmethod
+    def from_config(cls, controller_type, controller_options, *, axes, tcp):
+        """Construct a registered controller and configure its software tool."""
+        from cri.controller import get_controller
+
+        robot = cls(get_controller(controller_type)(**controller_options))
+        try:
+            robot.axes = axes
+            robot.tcp = tcp
+        except BaseException:
+            robot.close()
+            raise
+        return robot
+
+    @contextmanager
+    def motion_session(self):
+        """Close after motion, first applying the backend's optional cleanup.
+
+        Motion preparation remains explicit. Ordinary ``with robot`` only
+        closes the connection and remains suitable for read-only sessions.
+        """
+        try:
+            yield self
+        finally:
+            try:
+                finish = getattr(self.controller, "finish_motion", None)
+                if finish is not None:
+                    finish()
+            finally:
+                self.close()
+
     @property
     def info(self):
         """Returns a unique robot identifier string.
@@ -506,6 +537,15 @@ class SyncRobot(Robot):
             self.controller.move_linear(target, elbow, wrist=wrist)
         else:
             raise ValueError("wrist must be 0 or 1")
+
+    def move_linear_approach(self, pose, previous_pose=None):
+        """Approach a sample, using a backend policy when one is available."""
+        approach = getattr(self.controller, "move_linear_approach", None)
+        if approach is None:
+            return self.move_linear(pose)
+        target = self._to_controller_pose(pose)
+        previous = None if previous_pose is None else self._to_controller_pose(previous_pose)
+        return approach(target, previous)
 
     def check_linear_targets(self, poses):
         """Check consecutive TCP targets using the controller's read-only IK."""
